@@ -5,44 +5,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class CausalSelfAttention(nn.Module):
+class MultiHeadSelfAttention(nn.Module):
     """
-    Single-head causal self-attention.
+    Multi-Head Causal Self-Attention.
 
-    The model can attend to the current token and
-    previous tokens, but never future tokens.
+    Input:
+        [batch_size, sequence_length, embedding_dim]
+
+    Output:
+        [batch_size, sequence_length, embedding_dim]
     """
 
-    def __init__(self, embedding_dim: int, max_seq_len: int):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_heads: int,
+        max_seq_len: int,
+    ):
         super().__init__()
 
+        if embedding_dim % num_heads != 0:
+            raise ValueError(
+                "embedding_dim must be divisible by num_heads"
+            )
+
         self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
+        self.head_dim = embedding_dim // num_heads
 
-        # Convert input embeddings into:
-        # Query, Key, and Value
-        self.query = nn.Linear(
+        # Instead of having separate Q/K/V layers for
+        # every head, we calculate all of them at once.
+        self.qkv = nn.Linear(
+            embedding_dim,
+            3 * embedding_dim,
+        )
+
+        # Combines the outputs of all attention heads.
+        self.output_projection = nn.Linear(
             embedding_dim,
             embedding_dim,
         )
 
-        self.key = nn.Linear(
-            embedding_dim,
-            embedding_dim,
-        )
-
-        self.value = nn.Linear(
-            embedding_dim,
-            embedding_dim,
-        )
-
-        # Causal mask:
-        #
-        # [[1, 0, 0, 0],
-        #  [1, 1, 0, 0],
-        #  [1, 1, 1, 0],
-        #  [1, 1, 1, 1]]
-        #
-        # This prevents tokens from seeing the future.
+        # Causal mask prevents tokens from seeing
+        # future tokens.
         mask = torch.tril(
             torch.ones(
                 max_seq_len,
@@ -50,10 +55,6 @@ class CausalSelfAttention(nn.Module):
             )
         )
 
-        # register_buffer means:
-        # - it is part of the model
-        # - it moves to CPU/GPU with the model
-        # - it isn't a trainable parameter
         self.register_buffer(
             "causal_mask",
             mask,
@@ -61,48 +62,104 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x shape:
+        x:
+            [B, T, C]
 
-        [batch_size, sequence_length, embedding_dim]
+        B = batch size
+        T = sequence length
+        C = embedding dimension
         """
 
         batch_size, seq_len, _ = x.shape
 
         # ------------------------------------------------
-        # 1. Create Query, Key, Value
+        # 1. Create Q, K, V
         # ------------------------------------------------
 
-        Q = self.query(x)
-        K = self.key(x)
-        V = self.value(x)
+        qkv = self.qkv(x)
 
-        # ------------------------------------------------
-        # 2. Calculate attention scores
-        # ------------------------------------------------
-
-        # K.transpose:
+        # [B, T, 3C]
         #
-        # [batch, seq, dim]
+        # Split into:
+        #
+        # [B, T, C]
+        # [B, T, C]
+        # [B, T, C]
+
+        Q, K, V = qkv.chunk(3, dim=-1)
+
+        # ------------------------------------------------
+        # 2. Split into multiple heads
+        # ------------------------------------------------
+
+        # Current:
+        #
+        # [B, T, C]
+        #
+        # We want:
+        #
+        # [B, num_heads, T, head_dim]
+
+        Q = Q.view(
+            batch_size,
+            seq_len,
+            self.num_heads,
+            self.head_dim,
+        )
+
+        K = K.view(
+            batch_size,
+            seq_len,
+            self.num_heads,
+            self.head_dim,
+        )
+
+        V = V.view(
+            batch_size,
+            seq_len,
+            self.num_heads,
+            self.head_dim,
+        )
+
+        # Move heads before sequence dimension.
+        #
+        # [B, T, H, D]
         #
         # becomes:
         #
-        # [batch, dim, seq]
+        # [B, H, T, D]
+
+        Q = Q.transpose(1, 2)
+        K = K.transpose(1, 2)
+        V = V.transpose(1, 2)
+
+        # ------------------------------------------------
+        # 3. Calculate attention scores
+        # ------------------------------------------------
+
+        # Q:
+        # [B, H, T, D]
+        #
+        # K.transpose:
+        # [B, H, D, T]
+        #
+        # Result:
+        # [B, H, T, T]
 
         scores = Q @ K.transpose(-2, -1)
 
-        # ------------------------------------------------
-        # 3. Scale the scores
-        # ------------------------------------------------
-
         scores = scores / math.sqrt(
-            self.embedding_dim
+            self.head_dim
         )
 
         # ------------------------------------------------
-        # 4. Apply causal mask
+        # 4. Causal masking
         # ------------------------------------------------
 
-        mask = self.causal_mask[:seq_len, :seq_len]
+        mask = self.causal_mask[
+            :seq_len,
+            :seq_len,
+        ]
 
         scores = scores.masked_fill(
             mask == 0,
@@ -110,7 +167,7 @@ class CausalSelfAttention(nn.Module):
         )
 
         # ------------------------------------------------
-        # 5. Convert scores to probabilities
+        # 5. Softmax
         # ------------------------------------------------
 
         attention_weights = F.softmax(
@@ -123,5 +180,27 @@ class CausalSelfAttention(nn.Module):
         # ------------------------------------------------
 
         output = attention_weights @ V
+
+        # [B, H, T, D]
+
+        # ------------------------------------------------
+        # 7. Combine attention heads
+        # ------------------------------------------------
+
+        output = output.transpose(1, 2)
+
+        # [B, T, H, D]
+
+        output = output.contiguous().view(
+            batch_size,
+            seq_len,
+            self.embedding_dim,
+        )
+
+        # ------------------------------------------------
+        # 8. Final linear projection
+        # ------------------------------------------------
+
+        output = self.output_projection(output)
 
         return output
